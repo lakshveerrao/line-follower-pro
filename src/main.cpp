@@ -11,6 +11,8 @@
 #include "wifi_manager.h"
 #include "oled_ui.h"
 #include "web_dashboard.h"
+#include <Wire.h>
+#include <U8g2lib.h>
 
 RobotSettings settings;
 SystemState systemState;
@@ -24,6 +26,593 @@ static unsigned long junctionTurnUntil = 0;
 static int lastError = 0;
 static MoveChoice activeJunctionMove = MoveChoice::None;
 static bool placeholderShown = false;
+
+static Adafruit_SH1106G testDisplay(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET_PIN);
+static U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2Test(U8G2_R0, U8X8_PIN_NONE, I2C_SCL_PIN, I2C_SDA_PIN);
+static bool testDisplayOk = false;
+static bool u8g2TestOk = false;
+static Adafruit_SH1106G bootDisplay(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET_PIN);
+static bool bootDisplayOk = false;
+static Adafruit_SH1106G autoDebugDisplay(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET_PIN);
+static bool autoDebugDisplayOk = false;
+static uint8_t autoDebugI2cCount = 0;
+static uint8_t autoDebugOledAddress = 0;
+static unsigned long autoDebugCenterSavedUntil = 0;
+
+static void bootPause(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    yield();
+  }
+}
+
+static void drawBootScreen(const __FlashStringHelper *line1,
+                           const __FlashStringHelper *line2 = nullptr,
+                           const __FlashStringHelper *line3 = nullptr,
+                           const __FlashStringHelper *line4 = nullptr) {
+  if (!bootDisplayOk) return;
+  bootDisplay.clearDisplay();
+  bootDisplay.setTextColor(SH110X_WHITE);
+  bootDisplay.setTextSize(1);
+  bootDisplay.drawRect(0, 0, OLED_WIDTH, OLED_HEIGHT, SH110X_WHITE);
+  bootDisplay.setCursor(6, 8);
+  bootDisplay.print(line1);
+  if (line2) {
+    bootDisplay.setCursor(6, 22);
+    bootDisplay.print(line2);
+  }
+  if (line3) {
+    bootDisplay.setCursor(6, 36);
+    bootDisplay.print(line3);
+  }
+  if (line4) {
+    bootDisplay.setCursor(6, 50);
+    bootDisplay.print(line4);
+  }
+  bootDisplay.display();
+}
+
+static void beginBootDisplay() {
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(100000);
+  bootDisplayOk = bootDisplay.begin(OLED_I2C_ADDR, true);
+  if (!bootDisplayOk) bootDisplayOk = bootDisplay.begin(0x3D, true);
+  if (bootDisplayOk) bootDisplay.setContrast(255);
+}
+
+static void scanI2cBus() {
+  Serial.println("I2C scan start");
+  uint8_t found = 0;
+  for (uint8_t address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("I2C found 0x");
+      if (address < 16) Serial.print('0');
+      Serial.println(address, HEX);
+      found++;
+    }
+  }
+  if (found == 0) {
+    Serial.println("I2C found none");
+  }
+  Serial.println("I2C scan done");
+}
+
+static uint8_t scanI2cBusCompact(uint8_t *firstAddress) {
+  uint8_t found = 0;
+  if (firstAddress) *firstAddress = 0;
+  for (uint8_t address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) {
+      if (found == 0 && firstAddress) *firstAddress = address;
+      found++;
+    }
+  }
+  return found;
+}
+
+static void rawOledCommand(uint8_t address, uint8_t command) {
+  Wire.beginTransmission(address);
+  Wire.write(0x00);
+  Wire.write(command);
+  Wire.endTransmission();
+}
+
+static void rawOledData(uint8_t address, uint8_t data) {
+  Wire.beginTransmission(address);
+  Wire.write(0x40);
+  for (uint8_t i = 0; i < 16; i++) {
+    Wire.write(data);
+  }
+  Wire.endTransmission();
+}
+
+static void rawOledInitAndFill(uint8_t address, bool sh1106Mode) {
+  const uint8_t init[] = {
+    0xAE,       // display off
+    0xD5, 0x80, // clock
+    0xA8, 0x3F, // multiplex
+    0xD3, 0x00, // offset
+    0x40,       // start line
+    0xA1,       // segment remap
+    0xC8,       // COM scan direction
+    0xDA, 0x12, // COM pins
+    0x81, 0xFF, // contrast
+    0xD9, 0xF1, // precharge
+    0xDB, 0x40, // vcomh
+    0xA4,       // resume RAM display
+    0xA6,       // normal display
+    0xAF        // display on
+  };
+  for (uint8_t i = 0; i < sizeof(init); i++) {
+    rawOledCommand(address, init[i]);
+    delay(2);
+  }
+
+  // SSD1306 charge pump. SH1106 ignores unsupported commands on most modules.
+  rawOledCommand(address, 0x8D);
+  rawOledCommand(address, 0x14);
+  rawOledCommand(address, 0xAF);
+
+  for (uint8_t page = 0; page < 8; page++) {
+    rawOledCommand(address, 0xB0 | page);
+    uint8_t col = sh1106Mode ? 2 : 0;
+    rawOledCommand(address, 0x00 | (col & 0x0F));
+    rawOledCommand(address, 0x10 | (col >> 4));
+    for (uint8_t chunk = 0; chunk < 8; chunk++) {
+      rawOledData(address, 0xFF);
+    }
+  }
+}
+
+static const char *joyName(JoyEvent event) {
+  switch (event) {
+    case JoyEvent::Up: return "UP";
+    case JoyEvent::Down: return "DOWN";
+    case JoyEvent::Left: return "LEFT";
+    case JoyEvent::Right: return "RIGHT";
+    case JoyEvent::Press: return "PRESS";
+    case JoyEvent::LongPress: return "LONG";
+    default: return "CENTER";
+  }
+}
+
+static void beginJoystickOledTest() {
+  joystick.begin();
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(100000);
+  scanI2cBus();
+  testDisplayOk = testDisplay.begin(OLED_I2C_ADDR, true);
+  if (!testDisplayOk) testDisplayOk = testDisplay.begin(0x3D, true);
+  u8g2Test.setI2CAddress(OLED_I2C_ADDR << 1);
+  u8g2TestOk = u8g2Test.begin();
+  u8g2Test.setContrast(255);
+
+  Serial.println();
+  Serial.println("JOYSTICK + OLED TEST");
+  Serial.print("Adafruit OLED ");
+  Serial.println(testDisplayOk ? "OK" : "FAILED");
+  Serial.print("U8G2 OLED ");
+  Serial.println(u8g2TestOk ? "OK" : "FAILED");
+  Serial.println("Pins: VRX=1 VRY=2 SW=4 SDA=8 SCL=9");
+
+  if (u8g2TestOk) {
+    u8g2Test.clearBuffer();
+    u8g2Test.setFont(u8g2_font_6x10_tf);
+    u8g2Test.drawFrame(0, 0, 128, 64);
+    u8g2Test.drawStr(8, 14, "U8G2 SH1106 OK");
+    u8g2Test.drawStr(8, 30, "ADDR 0x3C");
+    u8g2Test.drawStr(8, 46, "SDA8 SCL9");
+    u8g2Test.sendBuffer();
+  } else if (testDisplayOk) {
+    testDisplay.setContrast(255);
+    testDisplay.clearDisplay();
+    testDisplay.setTextColor(SH110X_WHITE);
+    testDisplay.setTextSize(1);
+    testDisplay.setCursor(0, 0);
+    testDisplay.print("JOYSTICK OLED TEST");
+    testDisplay.setCursor(0, 16);
+    testDisplay.print("Move stick / press");
+    testDisplay.display();
+  }
+}
+
+static void runJoystickOledTest(JoyEvent event) {
+  static unsigned long last = 0;
+  unsigned long now = millis();
+  if (now - last < 120) return;
+  last = now;
+
+  Serial.print("JOY x=");
+  Serial.print(joystick.rawX());
+  Serial.print(" y=");
+  Serial.print(joystick.rawY());
+  Serial.print(" sw=");
+  Serial.print(joystick.pressed() ? "PRESSED" : "open");
+  Serial.print(" event=");
+  Serial.println(joyName(event == JoyEvent::None ? joystick.lastAxisEvent() : event));
+
+  if (!testDisplayOk && !u8g2TestOk) return;
+  if (u8g2TestOk) {
+    char line[24];
+    u8g2Test.clearBuffer();
+    u8g2Test.setFont(u8g2_font_6x10_tf);
+    u8g2Test.drawFrame(0, 0, 128, 64);
+    u8g2Test.drawStr(5, 12, "JOYSTICK TEST U8G2");
+    snprintf(line, sizeof(line), "X:%d Y:%d", joystick.rawX(), joystick.rawY());
+    u8g2Test.drawStr(5, 28, line);
+    snprintf(line, sizeof(line), "SW:%s", joystick.pressed() ? "PRESSED" : "open");
+    u8g2Test.drawStr(5, 42, line);
+    snprintf(line, sizeof(line), "DIR:%s", joyName(event == JoyEvent::None ? joystick.lastAxisEvent() : event));
+    u8g2Test.drawStr(5, 56, line);
+    u8g2Test.sendBuffer();
+  } else if (testDisplayOk) {
+    testDisplay.clearDisplay();
+    testDisplay.setTextColor(SH110X_WHITE);
+    testDisplay.setTextSize(1);
+    testDisplay.drawRect(0, 0, OLED_WIDTH, OLED_HEIGHT, SH110X_WHITE);
+    testDisplay.setCursor(5, 5);
+    testDisplay.print("JOYSTICK TEST");
+    testDisplay.setCursor(5, 18);
+    testDisplay.print("X:");
+    testDisplay.print(joystick.rawX());
+    testDisplay.setCursor(68, 18);
+    testDisplay.print("Y:");
+    testDisplay.print(joystick.rawY());
+    testDisplay.setCursor(5, 31);
+    testDisplay.print("SW:");
+    testDisplay.print(joystick.pressed() ? "PRESSED" : "open");
+    testDisplay.setCursor(5, 44);
+    testDisplay.print("DIR:");
+    testDisplay.print(joyName(event == JoyEvent::None ? joystick.lastAxisEvent() : event));
+    testDisplay.display();
+  }
+}
+
+static void runSensorSerialDebug() {
+  static unsigned long lastPrint = 0;
+  sensors.update();
+  unsigned long now = millis();
+  if (now - lastPrint < 250) return;
+  lastPrint = now;
+
+  Serial.print("SENSOR raw=");
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
+    if (i) Serial.print(',');
+    Serial.print(sensors.value(i));
+  }
+  Serial.print(" norm=");
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
+    if (i) Serial.print(',');
+    Serial.print(sensors.lineValue(i));
+  }
+  Serial.print(" active=");
+  Serial.print(sensors.activeCount());
+  Serial.print(" pos=");
+  Serial.print(sensors.position());
+  Serial.print(" err=");
+  Serial.println(sensors.error());
+}
+
+static void beginAutoDebugMode() {
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(100000);
+  autoDebugI2cCount = scanI2cBusCompact(&autoDebugOledAddress);
+  autoDebugDisplayOk = autoDebugDisplay.begin(OLED_I2C_ADDR, true);
+  if (!autoDebugDisplayOk) autoDebugDisplayOk = autoDebugDisplay.begin(0x3D, true);
+  if (autoDebugDisplayOk) {
+    autoDebugDisplay.setContrast(255);
+    autoDebugDisplay.clearDisplay();
+    autoDebugDisplay.setTextColor(SH110X_WHITE);
+    autoDebugDisplay.setTextSize(1);
+    autoDebugDisplay.drawRect(0, 0, OLED_WIDTH, OLED_HEIGHT, SH110X_WHITE);
+    autoDebugDisplay.setCursor(6, 8);
+    autoDebugDisplay.print("AUTO DEBUG MODE");
+    autoDebugDisplay.setCursor(6, 24);
+    autoDebugDisplay.print("Keep stick center");
+    autoDebugDisplay.setCursor(6, 40);
+    autoDebugDisplay.print("Motors OFF");
+    autoDebugDisplay.display();
+  }
+
+  motors.begin();
+  motors.stop();
+  joystick.begin();
+  sensors.begin();
+  Serial.println();
+  Serial.println("AUTO DEBUG MODE");
+  Serial.print("I2C devices=");
+  Serial.print(autoDebugI2cCount);
+  Serial.print(" first=0x");
+  if (autoDebugOledAddress < 16) Serial.print('0');
+  Serial.println(autoDebugOledAddress, HEX);
+  Serial.print("OLED=");
+  Serial.println(autoDebugDisplayOk ? "OK" : "FAILED");
+  Serial.println("Move joystick and place sensors on/off line. Motors stay OFF.");
+}
+
+static void runAutoDebugMode() {
+  static unsigned long last = 0;
+  unsigned long now = millis();
+  JoyEvent event = joystick.update();
+  if (event == JoyEvent::Press) {
+    joystick.recalibrateCenter();
+    autoDebugCenterSavedUntil = millis() + 1200;
+    Serial.println("DBG joystick center saved");
+  }
+  sensors.update();
+  motors.stop();
+
+  if (now - last < 200) return;
+  last = now;
+
+  JoyEvent dir = event == JoyEvent::None ? joystick.lastAxisEvent() : event;
+  Serial.print("DBG i2c=");
+  Serial.print(autoDebugI2cCount);
+  Serial.print(" oled=");
+  Serial.print(autoDebugDisplayOk ? 1 : 0);
+  Serial.print(" joy=");
+  Serial.print(joystick.rawX());
+  Serial.print('/');
+  Serial.print(joystick.rawY());
+  Serial.print(" center=");
+  Serial.print(joystick.centerX());
+  Serial.print('/');
+  Serial.print(joystick.centerY());
+  Serial.print(" sw=");
+  Serial.print(joystick.pressed() ? "PRESS" : "open");
+  Serial.print(" dir=");
+  Serial.print(joyName(dir));
+  Serial.print(" sensor=");
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
+    if (i) Serial.print(',');
+    Serial.print(sensors.value(i));
+  }
+  Serial.print(" active=");
+  Serial.print(sensors.activeCount());
+  Serial.print(" err=");
+  Serial.println(sensors.error());
+
+  if (!autoDebugDisplayOk) return;
+  autoDebugDisplay.clearDisplay();
+  autoDebugDisplay.setTextColor(SH110X_WHITE);
+  autoDebugDisplay.setTextSize(1);
+  autoDebugDisplay.setCursor(0, 0);
+  autoDebugDisplay.print("AUTO DEBUG");
+  autoDebugDisplay.setCursor(78, 0);
+  autoDebugDisplay.print(autoDebugDisplayOk ? "OLED OK" : "OLED BAD");
+  autoDebugDisplay.setCursor(0, 12);
+  autoDebugDisplay.print("I2C:");
+  autoDebugDisplay.print(autoDebugI2cCount);
+  autoDebugDisplay.print(" 0x");
+  if (autoDebugOledAddress < 16) autoDebugDisplay.print('0');
+  autoDebugDisplay.print(autoDebugOledAddress, HEX);
+  autoDebugDisplay.setCursor(0, 24);
+  autoDebugDisplay.print("X:");
+  autoDebugDisplay.print(joystick.rawX());
+  autoDebugDisplay.print("/");
+  autoDebugDisplay.print(joystick.centerX());
+  autoDebugDisplay.setCursor(68, 24);
+  autoDebugDisplay.print("Y:");
+  autoDebugDisplay.print(joystick.rawY());
+  autoDebugDisplay.setCursor(0, 36);
+  if (millis() < autoDebugCenterSavedUntil) {
+    autoDebugDisplay.print("CENTER SAVED");
+    autoDebugDisplay.display();
+    return;
+  }
+  autoDebugDisplay.print("SW:");
+  autoDebugDisplay.print(joystick.pressed() ? "PRESS" : "open");
+  autoDebugDisplay.print(" DIR:");
+  autoDebugDisplay.print(joyName(dir));
+  autoDebugDisplay.setCursor(0, 48);
+  autoDebugDisplay.print("S:");
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
+    autoDebugDisplay.print(sensors.value(i) / 100);
+    if (i < SENSOR_COUNT - 1) autoDebugDisplay.print(',');
+  }
+  autoDebugDisplay.setCursor(0, 58);
+  autoDebugDisplay.print("A:");
+  autoDebugDisplay.print(sensors.activeCount());
+  autoDebugDisplay.print(" E:");
+  autoDebugDisplay.print(sensors.error());
+  autoDebugDisplay.display();
+}
+
+static void runBootDiagnostics() {
+  if (!BOOT_DIAGNOSTICS) return;
+
+  uint8_t firstAddress = 0;
+  uint8_t i2cCount = scanI2cBusCompact(&firstAddress);
+  for (uint8_t i = 0; i < 8; i++) {
+    sensors.update();
+    bootPause(20);
+  }
+
+  bool joyOk = joystick.rawX() > 30 && joystick.rawX() < 4065 &&
+               joystick.rawY() > 30 && joystick.rawY() < 4065;
+  bool sensorOk = sensors.valid();
+
+  Serial.println("BOOT DIAGNOSTICS");
+  Serial.print("I2C devices=");
+  Serial.print(i2cCount);
+  Serial.print(" first=0x");
+  if (firstAddress < 16) Serial.print('0');
+  Serial.println(firstAddress, HEX);
+  Serial.print("Joystick center=");
+  Serial.print(joystick.centerX());
+  Serial.print('/');
+  Serial.print(joystick.centerY());
+  Serial.print(" ok=");
+  Serial.println(joyOk ? 1 : 0);
+  Serial.print("Sensors valid=");
+  Serial.print(sensorOk ? 1 : 0);
+  Serial.print(" active=");
+  Serial.print(sensors.activeCount());
+  Serial.print(" err=");
+  Serial.println(sensors.error());
+
+  oledUi.showMessage("Auto diagnostics", "OLED/I2C OK");
+  bootPause(900);
+
+  String joyLine = joyOk ? "Joystick OK " : "Joystick CHECK ";
+  joyLine += String(joystick.centerX()) + "/" + String(joystick.centerY());
+  oledUi.showMessage(joyLine, joystick.pressed() ? "Button pressed" : "Button open");
+  bootPause(900);
+
+  String sensorLine = sensorOk ? "Sensors OK " : "Sensors CHECK ";
+  sensorLine += "A:" + String(sensors.activeCount()) + " E:" + String(sensors.error());
+  oledUi.showMessage(sensorLine, "Motors OFF on boot");
+  bootPause(900);
+
+  if (!joyOk || !sensorOk || i2cCount == 0) {
+    logger.log("Boot diagnostics warning");
+  } else {
+    logger.log("Boot diagnostics OK");
+  }
+}
+
+static void runOledI2cDebug() {
+  static bool ran = false;
+  if (ran) {
+    delay(1500);
+    return;
+  }
+  ran = true;
+  Serial.println();
+  Serial.println("OLED I2C DEBUG");
+  Serial.print("SDA=");
+  Serial.print(I2C_SDA_PIN);
+  Serial.print(" SCL=");
+  Serial.println(I2C_SCL_PIN);
+  Serial.flush();
+
+  uint8_t pairs[2][2] = {{I2C_SDA_PIN, I2C_SCL_PIN}, {I2C_SCL_PIN, I2C_SDA_PIN}};
+  uint8_t found = 0;
+  uint8_t workingSda = I2C_SDA_PIN;
+  uint8_t workingScl = I2C_SCL_PIN;
+  for (uint8_t pair = 0; pair < 2; pair++) {
+    uint8_t sda = pairs[pair][0];
+    uint8_t scl = pairs[pair][1];
+    pinMode(sda, INPUT_PULLUP);
+    pinMode(scl, INPUT_PULLUP);
+    Wire.end();
+    Wire.begin(sda, scl);
+    Wire.setTimeOut(50);
+    Wire.setClock(50000);
+    Serial.print("Scan pair SDA=");
+    Serial.print(sda);
+    Serial.print(" SCL=");
+    Serial.println(scl);
+    for (uint8_t addr = 1; addr < 127; addr++) {
+      Wire.beginTransmission(addr);
+      uint8_t err = Wire.endTransmission();
+      if (err == 0) {
+        Serial.print("I2C found 0x");
+        if (addr < 16) Serial.print('0');
+        Serial.print(addr, HEX);
+        Serial.print(" on SDA=");
+        Serial.print(sda);
+        Serial.print(" SCL=");
+        Serial.println(scl);
+        found++;
+        workingSda = sda;
+        workingScl = scl;
+      }
+    }
+  }
+  if (found == 0) {
+    Serial.println("No I2C devices found on normal or swapped pins.");
+    Serial.println("Check OLED VCC=3.3V, GND, SDA, SCL, and solder/header.");
+  }
+  if (found > 0) {
+    Wire.end();
+    Wire.begin(workingSda, workingScl);
+    Wire.setClock(100000);
+    Adafruit_SH1106G testDisplay(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET_PIN);
+    bool ok = testDisplay.begin(OLED_I2C_ADDR, true);
+    Serial.print("SH1106 begin ");
+    Serial.println(ok ? "OK" : "FAILED");
+    if (ok) {
+      testDisplay.setContrast(255);
+      testDisplay.clearDisplay();
+      testDisplay.fillScreen(SH110X_WHITE);
+      testDisplay.display();
+      Serial.println("Adafruit SH1106 full white");
+      delay(1200);
+      testDisplay.invertDisplay(true);
+      testDisplay.display();
+      Serial.println("Adafruit SH1106 invert");
+      delay(1200);
+      testDisplay.invertDisplay(false);
+      testDisplay.clearDisplay();
+      testDisplay.setTextColor(SH110X_WHITE);
+      testDisplay.setTextSize(1);
+      testDisplay.drawRect(0, 0, OLED_WIDTH, OLED_HEIGHT, SH110X_WHITE);
+      testDisplay.setCursor(8, 12);
+      testDisplay.print("SH1106 OK");
+      testDisplay.setCursor(8, 28);
+      testDisplay.print("ADDR 0x3C");
+      testDisplay.setCursor(8, 44);
+      testDisplay.print("SDA");
+      testDisplay.print(workingSda);
+      testDisplay.print(" SCL");
+      testDisplay.print(workingScl);
+      testDisplay.display();
+      delay(1200);
+    }
+
+    Serial.println("Trying U8G2 SH1106");
+    U8G2_SH1106_128X64_NONAME_F_HW_I2C sh1106(U8G2_R0, U8X8_PIN_NONE, workingScl, workingSda);
+    sh1106.setI2CAddress(OLED_I2C_ADDR << 1);
+    if (sh1106.begin()) {
+      sh1106.setContrast(255);
+      sh1106.clearBuffer();
+      sh1106.drawBox(0, 0, 128, 64);
+      sh1106.sendBuffer();
+      delay(1200);
+      sh1106.clearBuffer();
+      sh1106.setFont(u8g2_font_6x10_tf);
+      sh1106.drawFrame(0, 0, 128, 64);
+      sh1106.drawStr(6, 14, "U8G2 SH1106");
+      sh1106.drawStr(6, 30, "ADDR 0x3C");
+      sh1106.drawStr(6, 46, "SDA9 SCL8");
+      sh1106.sendBuffer();
+      delay(1200);
+    } else {
+      Serial.println("U8G2 SH1106 begin FAILED");
+    }
+
+    Serial.println("Trying U8G2 SSD1306");
+    U8G2_SSD1306_128X64_NONAME_F_HW_I2C ssd1306(U8G2_R0, U8X8_PIN_NONE, workingScl, workingSda);
+    ssd1306.setI2CAddress(OLED_I2C_ADDR << 1);
+    if (ssd1306.begin()) {
+      ssd1306.setContrast(255);
+      ssd1306.clearBuffer();
+      ssd1306.drawBox(0, 0, 128, 64);
+      ssd1306.sendBuffer();
+      delay(1200);
+      ssd1306.clearBuffer();
+      ssd1306.setFont(u8g2_font_6x10_tf);
+      ssd1306.drawFrame(0, 0, 128, 64);
+      ssd1306.drawStr(6, 14, "U8G2 SSD1306");
+      ssd1306.drawStr(6, 30, "ADDR 0x3C");
+      ssd1306.drawStr(6, 46, "SDA9 SCL8");
+      ssd1306.sendBuffer();
+      delay(1200);
+    } else {
+      Serial.println("U8G2 SSD1306 begin FAILED");
+    }
+
+    Serial.println("Trying RAW SH1106 full white");
+    rawOledInitAndFill(OLED_I2C_ADDR, true);
+    delay(1800);
+    Serial.println("Trying RAW SSD1306 full white");
+    rawOledInitAndFill(OLED_I2C_ADDR, false);
+    delay(1800);
+  }
+  Serial.println("Debug scan complete.");
+}
 
 static bool isPlaceholderAlgorithm() {
   return settings.algorithm == AlgorithmMode::FloodFill ||
@@ -119,6 +708,12 @@ static void printLineDebug(unsigned long now) {
 }
 
 static void runLineFollower() {
+  if (!AUTONOMOUS_LINE_FOLLOW_ENABLED) {
+    systemState.running = false;
+    motors.stop();
+    return;
+  }
+
   if (!systemState.running || systemState.safeMode || systemState.emergency || motors.isEmergencyStopped()) {
     motors.stop();
     return;
@@ -169,8 +764,8 @@ static void runLineFollower() {
   int left = settings.motors.baseSpeed + static_cast<int>(correction);
   int right = settings.motors.baseSpeed - static_cast<int>(correction);
 
-  left = constrain(left, -MOTOR_MAX_PWM, MOTOR_MAX_PWM);
-  right = constrain(right, -MOTOR_MAX_PWM, MOTOR_MAX_PWM);
+  left = constrain(left, -AUTONOMOUS_MAX_PWM, AUTONOMOUS_MAX_PWM);
+  right = constrain(right, -AUTONOMOUS_MAX_PWM, AUTONOMOUS_MAX_PWM);
   motors.set(left, right);
 }
 
@@ -181,11 +776,51 @@ static void runManualMotorTest() {
     systemState.manualMotorTest = false;
     return;
   }
-  motors.set(settings.motors.leftSpeed, settings.motors.rightSpeed);
+  int left = systemState.manualLeft;
+  int right = systemState.manualRight;
+  if (left == 0 && right == 0) {
+    left = settings.motors.leftSpeed;
+    right = settings.motors.rightSpeed;
+  }
+  left = constrain(left, -MANUAL_TEST_MAX_PWM, MANUAL_TEST_MAX_PWM);
+  right = constrain(right, -MANUAL_TEST_MAX_PWM, MANUAL_TEST_MAX_PWM);
+  motors.set(left, right);
 }
 
 void setup() {
   Serial.begin(115200);
+
+  if (AUTO_DEBUG_MODE) {
+    beginAutoDebugMode();
+    return;
+  }
+
+  if (JOYSTICK_OLED_TEST) {
+    beginJoystickOledTest();
+    return;
+  }
+
+  if (OLED_I2C_DEBUG) {
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    Wire.setTimeOut(50);
+    Wire.setClock(100000);
+    return;
+  }
+
+  if (SENSOR_SERIAL_DEBUG) {
+    sensors.begin();
+    Serial.println();
+    Serial.println("SENSOR DEBUG");
+    Serial.print("LEDON=");
+    Serial.println(SENSOR_LEDON_PIN);
+    Serial.print("PINS=");
+    for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
+      if (i) Serial.print(',');
+      Serial.print(SENSOR_PINS[i]);
+    }
+    Serial.println();
+    return;
+  }
 
   if (JOYSTICK_SERIAL_DEBUG) {
     unsigned long serialStart = millis();
@@ -200,7 +835,13 @@ void setup() {
   }
 
   logger.begin();
+  beginBootDisplay();
+  drawBootScreen(F("Welcome to"), F("Line Follower OS"), F("Keep joystick"), F("centered"));
+  bootPause(1200);
+  drawBootScreen(F("Joystick"), F("calibrating..."), F("Do not move stick"));
   joystick.begin();
+  drawBootScreen(F("Joystick ready"), F("Center saved"), F("X/Y calibrated"));
+  bootPause(700);
   motors.begin(); // Motors are explicitly off before any other subsystem can start.
 
   unsigned long bootStart = millis();
@@ -211,6 +852,10 @@ void setup() {
 
   settingsStore.begin();
   settingsStore.load(settings);
+  settings.motors.baseSpeed = constrain(settings.motors.baseSpeed, 0, AUTONOMOUS_MAX_PWM);
+  settings.motors.turnSpeed = constrain(settings.motors.turnSpeed, 0, AUTONOMOUS_MAX_PWM);
+  settings.motors.leftSpeed = constrain(settings.motors.leftSpeed, 0, MANUAL_TEST_MAX_PWM);
+  settings.motors.rightSpeed = constrain(settings.motors.rightSpeed, 0, MANUAL_TEST_MAX_PWM);
   settings.sensors.threshold = constrain(settings.sensors.threshold, 0, 4095);
   sensors.begin();
   sensors.setCalibration(settings.sensors);
@@ -228,14 +873,43 @@ void setup() {
   wifiManager.begin(settings.wifiEnabled, settings.wifiSsid, settings.wifiPass);
   systemState.askPinSetup = !settings.pinEnabled;
   oledUi.begin(&settings, &systemState);
+  runBootDiagnostics();
+  oledUi.showMessage("WiFi LineFollowerOS", "Password line12345");
+  bootPause(1600);
+  oledUi.showHome();
   webDashboard.begin(&settings, &systemState, &pid);
   pid.setTunings(settings.kp, settings.ki, settings.kd);
 
   if (systemState.safeMode) logger.log("Boot joystick hold detected");
   logger.log("Line Follower OS ready");
+  systemState.running = false;
+  systemState.manualMotorTest = false;
+  motors.stop();
 }
 
 void loop() {
+  if (AUTO_DEBUG_MODE) {
+    runAutoDebugMode();
+    return;
+  }
+
+  if (JOYSTICK_OLED_TEST) {
+    JoyEvent event = joystick.update();
+    runJoystickOledTest(event);
+    return;
+  }
+
+  if (OLED_I2C_DEBUG) {
+    runOledI2cDebug();
+    delay(1500);
+    return;
+  }
+
+  if (SENSOR_SERIAL_DEBUG) {
+    runSensorSerialDebug();
+    return;
+  }
+
   JoyEvent event = joystick.update();
 
   if (JOYSTICK_SERIAL_DEBUG) {

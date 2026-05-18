@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 #include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <Adafruit_SH110X.h>
 #include "settings_store.h"
 #include "joystick.h"
 
@@ -48,6 +48,7 @@ public:
   void update(JoyEvent event);
   void render(bool force = false);
   void showMessage(const String &line1, const String &line2 = "");
+  void showHome();
   void showJoystickDiagnostics();
   bool isSleeping() const;
 
@@ -90,7 +91,7 @@ private:
   const char *sleepLabel() const;
   const char *lockLabel() const;
 
-  Adafruit_SSD1306 _display{OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET_PIN};
+  Adafruit_SH1106G _display{OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET_PIN};
   RobotSettings *_settings = nullptr;
   SystemState *_state = nullptr;
   UiScreen _screen = UiScreen::Boot;

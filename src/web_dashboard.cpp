@@ -47,6 +47,11 @@ void WebDashboard::handleStatus() {
   json += "\"emergency\":" + String(_state->emergency ? "true" : "false") + ",";
   json += "\"safeMode\":" + String(_state->safeMode ? "true" : "false") + ",";
   json += "\"manualMotorTest\":" + String(_state->manualMotorTest ? "true" : "false") + ",";
+  json += "\"manualLeft\":" + String(_state->manualLeft) + ",";
+  json += "\"manualRight\":" + String(_state->manualRight) + ",";
+  json += "\"autoEnabled\":" + String(AUTONOMOUS_LINE_FOLLOW_ENABLED ? "true" : "false") + ",";
+  json += "\"autoMax\":" + String(AUTONOMOUS_MAX_PWM) + ",";
+  json += "\"manualMax\":" + String(MANUAL_TEST_MAX_PWM) + ",";
   json += "\"leftOut\":" + String(motors.leftOutput()) + ",";
   json += "\"rightOut\":" + String(motors.rightOutput()) + ",";
   json += "\"error\":" + String(sensors.error()) + ",";
@@ -71,19 +76,25 @@ void WebDashboard::handleStatus() {
 void WebDashboard::handleControl() {
   String action = _server.arg("action");
   if (action == "start") {
-    if (!_state->safeMode && !_state->emergency && sensors.valid() && sensors.lineDetected()) {
+    if (AUTONOMOUS_LINE_FOLLOW_ENABLED && !_state->safeMode && !_state->emergency && sensors.valid() && sensors.lineDetected()) {
       _state->running = true;
       _state->manualMotorTest = false;
+      _state->manualLeft = 0;
+      _state->manualRight = 0;
       logger.log("Web start");
     }
   } else if (action == "stop") {
     _state->running = false;
     _state->manualMotorTest = false;
+    _state->manualLeft = 0;
+    _state->manualRight = 0;
     motors.stop();
     logger.log("Web stop");
   } else if (action == "estop") {
     _state->running = false;
     _state->manualMotorTest = false;
+    _state->manualLeft = 0;
+    _state->manualRight = 0;
     _state->emergency = true;
     motors.emergencyStop();
     logger.log("Web emergency stop");
@@ -95,9 +106,39 @@ void WebDashboard::handleControl() {
   } else if (action == "manual_on") {
     _state->running = false;
     _state->manualMotorTest = true;
+    _state->manualLeft = constrain(_settings->motors.leftSpeed, 0, MANUAL_TEST_MAX_PWM);
+    _state->manualRight = constrain(_settings->motors.rightSpeed, 0, MANUAL_TEST_MAX_PWM);
   } else if (action == "manual_off") {
     _state->manualMotorTest = false;
+    _state->manualLeft = 0;
+    _state->manualRight = 0;
     motors.stop();
+  } else if (action == "manual_stop") {
+    _state->running = false;
+    _state->manualMotorTest = true;
+    _state->manualLeft = 0;
+    _state->manualRight = 0;
+    motors.stop();
+  } else if (action == "manual_forward") {
+    _state->running = false;
+    _state->manualMotorTest = true;
+    _state->manualLeft = MANUAL_TEST_MAX_PWM;
+    _state->manualRight = MANUAL_TEST_MAX_PWM;
+  } else if (action == "manual_back") {
+    _state->running = false;
+    _state->manualMotorTest = true;
+    _state->manualLeft = -MANUAL_TEST_MAX_PWM;
+    _state->manualRight = -MANUAL_TEST_MAX_PWM;
+  } else if (action == "manual_left") {
+    _state->running = false;
+    _state->manualMotorTest = true;
+    _state->manualLeft = -MANUAL_TEST_MAX_PWM;
+    _state->manualRight = MANUAL_TEST_MAX_PWM;
+  } else if (action == "manual_right") {
+    _state->running = false;
+    _state->manualMotorTest = true;
+    _state->manualLeft = MANUAL_TEST_MAX_PWM;
+    _state->manualRight = -MANUAL_TEST_MAX_PWM;
   } else if (action == "cal_black") {
     sensors.calibrateBlack();
     _settings->sensors = sensors.calibration();
@@ -119,10 +160,10 @@ void WebDashboard::handleSettings() {
   if (_server.hasArg("kp")) _settings->kp = max(0.0f, _server.arg("kp").toFloat());
   if (_server.hasArg("ki")) _settings->ki = max(0.0f, _server.arg("ki").toFloat());
   if (_server.hasArg("kd")) _settings->kd = max(0.0f, _server.arg("kd").toFloat());
-  if (_server.hasArg("base")) _settings->motors.baseSpeed = constrain(_server.arg("base").toInt(), 0, MOTOR_MAX_PWM);
-  if (_server.hasArg("turn")) _settings->motors.turnSpeed = constrain(_server.arg("turn").toInt(), 0, MOTOR_MAX_PWM);
-  if (_server.hasArg("left")) _settings->motors.leftSpeed = constrain(_server.arg("left").toInt(), 0, MOTOR_MAX_PWM);
-  if (_server.hasArg("right")) _settings->motors.rightSpeed = constrain(_server.arg("right").toInt(), 0, MOTOR_MAX_PWM);
+  if (_server.hasArg("base")) _settings->motors.baseSpeed = constrain(_server.arg("base").toInt(), 0, AUTONOMOUS_MAX_PWM);
+  if (_server.hasArg("turn")) _settings->motors.turnSpeed = constrain(_server.arg("turn").toInt(), 0, AUTONOMOUS_MAX_PWM);
+  if (_server.hasArg("left")) _settings->motors.leftSpeed = constrain(_server.arg("left").toInt(), 0, MANUAL_TEST_MAX_PWM);
+  if (_server.hasArg("right")) _settings->motors.rightSpeed = constrain(_server.arg("right").toInt(), 0, MANUAL_TEST_MAX_PWM);
   if (_server.hasArg("threshold")) {
     _settings->sensors.threshold = constrain(_server.arg("threshold").toInt(), 0, 4095);
     sensors.setCalibration(_settings->sensors);
@@ -157,7 +198,12 @@ label{display:block;margin-top:8px}.small{color:#aaa;font-size:13px}
 <section class=panel><h3>Control</h3>
 <button class=ok onclick="cmd('start')">Start</button><button onclick="cmd('stop')">Stop</button>
 <button class=danger onclick="cmd('estop')">Emergency Stop</button><button onclick="cmd('clear_estop')">Clear E-Stop</button>
-<button onclick="cmd('manual_on')">Manual Motor Test</button><button onclick="cmd('manual_off')">Manual Off</button></section>
+<button onclick="cmd('manual_on')">Manual Motor Test</button><button onclick="cmd('manual_off')">Manual Off</button>
+<div class=grid>
+<button onclick="cmd('manual_forward')">Forward</button><button onclick="cmd('manual_back')">Back</button>
+<button onclick="cmd('manual_left')">Left</button><button onclick="cmd('manual_right')">Right</button>
+<button class=danger onclick="cmd('manual_stop')">Motor Stop</button>
+</div></section>
 <section class=panel><h3>Status</h3><div id=status></div></section>
 <section class=panel><h3>Sensors</h3><div class=sensors id=sensors></div>
 <button onclick="cmd('cal_white')">Calibrate White</button><button onclick="cmd('cal_black')">Calibrate Black</button></section>
@@ -174,7 +220,7 @@ async function cmd(a){await api('/api/control?action='+a,{method:'POST'});refres
 async function save(){let q=new URLSearchParams({kp:kp.value,ki:ki.value,kd:kd.value,base:base.value,turn:turn.value,threshold:threshold.value,algorithm:algorithm.value});await api('/api/settings?'+q,{method:'POST'});refresh()}
 function setInputs(d){if(!first)return;kp.value=d.kp;ki.value=d.ki;kd.value=d.kd;base.value=d.baseSpeed;turn.value=d.turnSpeed;threshold.value=d.threshold;first=false}
 async function refresh(){let d=await api('/api/status');setInputs(d);net.textContent='AP '+d.apIp+' | STA '+d.staIp;
-status.innerHTML=`Run: ${d.running} | Safe: ${d.safeMode} | EStop: ${d.emergency}<br>Motor L/R: ${d.leftOut}/${d.rightOut}<br>Error: ${d.error} PID: ${d.pidOut}<br>Algorithm: ${d.algorithm} Battery: ${d.battery}`;
+status.innerHTML=`Run: ${d.running} | Manual: ${d.manualMotorTest} | Safe: ${d.safeMode} | EStop: ${d.emergency}<br>Motor L/R: ${d.leftOut}/${d.rightOut} | Manual target: ${d.manualLeft}/${d.manualRight}<br>Auto: ${d.autoEnabled} max ${d.autoMax} | Manual max ${d.manualMax}<br>Error: ${d.error} PID: ${d.pidOut}<br>Algorithm: ${d.algorithm} Battery: ${d.battery}`;
 route.textContent=`Junctions ${d.junctions} | ${d.route}`;
 sensors.innerHTML=d.sensors.map((v,i)=>`<div>S${i+1} ${v}<div class=bar><div class=fill style="width:${Math.min(100,v/40.95)}%"></div></div></div>`).join('')}
 setInterval(refresh,500);refresh();

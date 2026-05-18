@@ -33,11 +33,11 @@ void OledUi::begin(RobotSettings *settings, SystemState *state) {
   _settings = settings;
   _state = state;
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  if (!_display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR)) {
-    _display.begin(SSD1306_SWITCHCAPVCC, 0x3D);
+  if (!_display.begin(OLED_I2C_ADDR, true)) {
+    _display.begin(0x3D, true);
   }
   _display.clearDisplay();
-  _display.setTextColor(SSD1306_WHITE);
+  _display.setTextColor(SH110X_WHITE);
   _screen = state->askPinSetup ? UiScreen::DevicePin : UiScreen::MainMenu;
   _lastActivity = millis();
 }
@@ -149,9 +149,17 @@ void OledUi::showMessage(const String &line1, const String &line2) {
   render(true);
 }
 
+void OledUi::showHome() {
+  _screen = _state->askPinSetup ? UiScreen::DevicePin : UiScreen::MainMenu;
+  _selected = 0;
+  _top = 0;
+  touch();
+  render(true);
+}
+
 void OledUi::showJoystickDiagnostics() {
   _display.clearDisplay();
-  _display.setTextColor(SSD1306_WHITE);
+  _display.setTextColor(SH110X_WHITE);
   _display.setTextSize(1);
   _display.setCursor(0, 0);
   _display.print("JOYSTICK DEBUG");
@@ -160,11 +168,15 @@ void OledUi::showJoystickDiagnostics() {
   _display.print(JOY_X_PIN);
   _display.print(": ");
   _display.print(joystick.rawX());
+  _display.print("/");
+  _display.print(joystick.centerX());
   _display.setCursor(0, 26);
   _display.print("Y GPIO ");
   _display.print(JOY_Y_PIN);
   _display.print(": ");
   _display.print(joystick.rawY());
+  _display.print("/");
+  _display.print(joystick.centerY());
   _display.setCursor(0, 38);
   _display.print("SW GPIO ");
   _display.print(JOY_BTN_PIN);
@@ -197,7 +209,7 @@ void OledUi::drawStatusBar() {
   if (_settings->pinEnabled) _display.print(_state->locked ? "L" : "U");
   _display.setCursor(112, 0);
   _display.print(BATTERY_SENSE_ENABLED ? String(battery.percent()) + "%" : "USB");
-  _display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+  _display.drawLine(0, 10, 127, 10, SH110X_WHITE);
 }
 
 void OledUi::drawMenu(const char *title, const char *const *items, uint8_t count, uint8_t selected, uint8_t top) {
@@ -208,12 +220,12 @@ void OledUi::drawMenu(const char *title, const char *const *items, uint8_t count
     if (idx >= count) break;
     uint8_t y = 24 + row * 10;
     if (idx == selected) {
-      _display.fillRect(0, y - 1, 128, 9, SSD1306_WHITE);
-      _display.setTextColor(SSD1306_BLACK);
+      _display.fillRect(0, y - 1, 128, 9, SH110X_WHITE);
+      _display.setTextColor(SH110X_BLACK);
     }
     _display.setCursor(2, y);
     _display.print(items[idx]);
-    _display.setTextColor(SSD1306_WHITE);
+    _display.setTextColor(SH110X_WHITE);
   }
 }
 
@@ -282,14 +294,14 @@ void OledUi::drawWifiScan() {
     if (idx >= _scanCount) break;
     uint8_t y = 24 + row * 10;
     if (idx == _selected) {
-      _display.fillRect(0, y - 1, 128, 9, SSD1306_WHITE);
-      _display.setTextColor(SSD1306_BLACK);
+      _display.fillRect(0, y - 1, 128, 9, SH110X_WHITE);
+      _display.setTextColor(SH110X_BLACK);
     }
     _display.setCursor(2, y);
     _display.print(wifiManager.ssidAt(idx).substring(0, 14));
     _display.setCursor(96, y);
     _display.print(wifiManager.rssiAt(idx));
-    _display.setTextColor(SSD1306_WHITE);
+    _display.setTextColor(SH110X_WHITE);
   }
 }
 
@@ -302,13 +314,13 @@ void OledUi::drawKeypad() {
       if (idx >= strlen(KEYMAP)) break;
       uint8_t px = x * 12;
       uint8_t py = 36 + y * 9;
-      if (x == _keyX && y == _keyY) _display.drawRect(px, py - 1, 11, 9, SSD1306_WHITE);
+      if (x == _keyX && y == _keyY) _display.drawRect(px, py - 1, 11, 9, SH110X_WHITE);
       _display.setCursor(px + 2, py);
       _display.print(KEYMAP[idx]);
     }
   }
-  if (_keyY == 3 && _keyX < 5) _display.drawRect(0, 55, 45, 9, SSD1306_WHITE);
-  if (_keyY == 3 && _keyX >= 5) _display.drawRect(72, 55, 38, 9, SSD1306_WHITE);
+  if (_keyY == 3 && _keyX < 5) _display.drawRect(0, 55, 45, 9, SH110X_WHITE);
+  if (_keyY == 3 && _keyX >= 5) _display.drawRect(72, 55, 38, 9, SH110X_WHITE);
   _display.setCursor(3, 56); _display.print("DEL");
   _display.setCursor(76, 56); _display.print("SAVE");
 }
@@ -320,7 +332,7 @@ void OledUi::drawPinEntry() {
   _display.print(_pinUnlockMode ? "Enter PIN" : "Set 4-digit PIN");
   for (uint8_t i = 0; i < 4; i++) {
     uint8_t x = 28 + i * 18;
-    if (i == _pinPos) _display.drawRect(x - 3, 29, 14, 15, SSD1306_WHITE);
+    if (i == _pinPos) _display.drawRect(x - 3, 29, 14, 15, SH110X_WHITE);
     _display.setCursor(x, 33);
     _display.print(_pinEdit[i]);
   }
@@ -354,6 +366,12 @@ void OledUi::handleMain(JoyEvent event) {
   if (event != JoyEvent::Press) return;
   switch (_selected) {
     case 0:
+      if (!AUTONOMOUS_LINE_FOLLOW_ENABLED) {
+        _state->running = false;
+        motors.stop();
+        showMessage("Auto drive OFF", "Use manual test only");
+        break;
+      }
       if (_state->safeMode || _state->emergency || !sensors.valid() || !sensors.lineDetected()) {
         _state->running = false;
         showMessage("Cannot start", "Check safe/sensors");
