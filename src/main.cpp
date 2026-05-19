@@ -852,6 +852,8 @@ void setup() {
 
   settingsStore.begin();
   settingsStore.load(settings);
+  settings.screenSleepIndex = 6; // Keep OLED awake by default during hardware bring-up.
+  settings.autoLockIndex = constrain((int)settings.autoLockIndex, 0, 2);
   settings.motors.baseSpeed = constrain(settings.motors.baseSpeed, 0, AUTONOMOUS_MAX_PWM);
   settings.motors.turnSpeed = constrain(settings.motors.turnSpeed, 0, AUTONOMOUS_MAX_PWM);
   settings.motors.leftSpeed = constrain(settings.motors.leftSpeed, 0, MANUAL_TEST_MAX_PWM);

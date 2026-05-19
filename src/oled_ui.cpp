@@ -36,8 +36,21 @@ void OledUi::begin(RobotSettings *settings, SystemState *state) {
   if (!_display.begin(OLED_I2C_ADDR, true)) {
     _display.begin(0x3D, true);
   }
+  _display.setContrast(255);
+  _display.invertDisplay(false);
+  _display.clearDisplay();
+  _display.fillScreen(SH110X_WHITE);
+  _display.display();
+  delay(250);
   _display.clearDisplay();
   _display.setTextColor(SH110X_WHITE);
+  _display.setTextSize(1);
+  _display.setCursor(0, 0);
+  _display.print("Line Follower OS");
+  _display.setCursor(0, 16);
+  _display.print("OLED OK");
+  _display.display();
+  delay(650);
   _screen = state->askPinSetup ? UiScreen::DevicePin : UiScreen::MainMenu;
   _lastActivity = millis();
 }
