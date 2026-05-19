@@ -42,13 +42,44 @@ static U8G2_SH1106_128X64_NONAME_F_HW_I2C compatDisplay(U8G2_R0, U8X8_PIN_NONE, 
 static bool compatDisplayOk = false;
 static uint8_t compatSelected = 0;
 static uint8_t compatTop = 0;
+static uint8_t compatSubSelected = 0;
+static uint8_t compatSubTop = 0;
 static unsigned long compatLastRender = 0;
+
+enum class CompatScreen : uint8_t {
+  Main,
+  Motor,
+  Pid,
+  Sensor,
+  Algorithm,
+  Junction,
+  Route,
+  Debug,
+  Battery,
+  Wifi,
+  Pin,
+  ScreenLock,
+  Reset,
+  About
+};
+
+static CompatScreen compatScreen = CompatScreen::Main;
 
 static const char *const COMPAT_ITEMS[] = {
   "Start / Stop", "Emergency Stop", "Motor Settings", "PID Settings",
-  "Sensor Settings", "Algorithm", "Debug", "Battery", "WiFi", "About"
+  "Sensor Settings", "Algorithm Select", "Junction Memory", "Route Memory",
+  "Debug Mode", "Battery Status", "Wi-Fi Settings", "Device PIN",
+  "Screen & Lock", "Reset Options", "About Device"
 };
 static constexpr uint8_t COMPAT_ITEM_COUNT = sizeof(COMPAT_ITEMS) / sizeof(COMPAT_ITEMS[0]);
+static const char *const COMPAT_MOTOR_ITEMS[] = {"Manual motor test", "Left motor speed", "Right motor speed", "Base speed", "Turn speed", "Save motor"};
+static const char *const COMPAT_PID_ITEMS[] = {"Kp", "Ki", "Kd", "Save PID", "Reset PID"};
+static const char *const COMPAT_SENSOR_ITEMS[] = {"Live sensor values", "Calibrate black", "Calibrate white", "Sensor threshold", "Save sensor"};
+static const char *const COMPAT_ALG_ITEMS[] = {"Normal line follow", "Left hand rule", "Right hand rule", "Path memory", "Flood fill", "A*", "Dijkstra"};
+static const char *const COMPAT_WIFI_ITEMS[] = {"WiFi off/on", "Show AP login", "IP / Signal", "Save WiFi"};
+static const char *const COMPAT_PIN_ITEMS[] = {"Setup PIN safety?", "Toggle PIN", "Reset PIN 0000", "Save PIN"};
+static const char *const COMPAT_SCREEN_ITEMS[] = {"Screen sleep", "Auto lock", "Save screen"};
+static const char *const COMPAT_RESET_ITEMS[] = {"Reset robot", "Factory reset", "Pairing reset"};
 
 static void bootPause(unsigned long ms) {
   unsigned long start = millis();
@@ -198,6 +229,76 @@ static void compatShowMessage(const char *line1, const char *line2 = "") {
   compatDisplay.sendBuffer();
 }
 
+static void compatSave(const char *line1 = "Settings saved", const char *line2 = "Stored in NVS") {
+  settingsStore.save(settings);
+  compatShowMessage(line1, line2);
+  delay(550);
+}
+
+static void compatBackToMain(bool save = true) {
+  systemState.manualMotorTest = false;
+  motors.stop();
+  if (save) settingsStore.save(settings);
+  compatScreen = CompatScreen::Main;
+  compatSubSelected = 0;
+  compatSubTop = 0;
+  compatLastRender = 0;
+}
+
+static void compatEnter(CompatScreen screen) {
+  compatScreen = screen;
+  compatSubSelected = 0;
+  compatSubTop = 0;
+  compatLastRender = 0;
+}
+
+static void compatDrawStatus() {
+  compatDisplay.setFont(u8g2_font_6x10_tf);
+  compatDisplay.drawStr(0, 8, systemState.running ? "RUN" : "STOP");
+  compatDisplay.drawStr(34, 8, systemState.safeMode ? "SAFE" : "OS");
+  compatDisplay.drawStr(66, 8, wifiManager.connected() ? "WiFi" : "AP");
+  compatDisplay.drawStr(100, 8, BATTERY_SENSE_ENABLED ? "BAT" : "USB");
+  compatDisplay.drawLine(0, 10, 127, 10);
+}
+
+static void compatDrawMenu(const char *title, const char *const *items, uint8_t count, uint8_t selected, uint8_t top) {
+  compatDrawStatus();
+  compatDisplay.drawStr(0, 20, title);
+  for (uint8_t row = 0; row < 4; row++) {
+    uint8_t idx = top + row;
+    if (idx >= count) break;
+    uint8_t y = 32 + row * 8;
+    if (idx == selected) {
+      compatDisplay.drawBox(0, y - 7, 128, 8);
+      compatDisplay.setDrawColor(0);
+    }
+    compatDisplay.drawStr(2, y, items[idx]);
+    compatDisplay.setDrawColor(1);
+  }
+}
+
+static const char *compatAlgorithmName(uint8_t idx) {
+  if (idx >= 7) return "?";
+  return COMPAT_ALG_ITEMS[idx];
+}
+
+static const char *compatSleepLabel() {
+  static char buf[8];
+  const uint8_t values[] = {5, 10, 15, 20, 25, 30, 0};
+  uint8_t idx = constrain((int)settings.screenSleepIndex, 0, 6);
+  if (values[idx] == 0) return "Never";
+  snprintf(buf, sizeof(buf), "%us", values[idx]);
+  return buf;
+}
+
+static const char *compatLockLabel() {
+  static char buf[8];
+  const uint8_t values[] = {10, 20, 30};
+  uint8_t idx = constrain((int)settings.autoLockIndex, 0, 2);
+  snprintf(buf, sizeof(buf), "%us", values[idx]);
+  return buf;
+}
+
 static void beginCompatUi() {
   if (!U8G2_COMPAT_UI) return;
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
@@ -222,86 +323,236 @@ static void renderCompatUi(bool force = false) {
 
   compatDisplay.clearBuffer();
   compatDisplay.setFont(u8g2_font_6x10_tf);
-  compatDisplay.drawStr(0, 8, systemState.running ? "RUN" : "STOP");
-  compatDisplay.drawStr(36, 8, systemState.safeMode ? "SAFE" : "OS");
-  compatDisplay.drawStr(88, 8, "USB");
-  compatDisplay.drawLine(0, 10, 127, 10);
-
-  for (uint8_t row = 0; row < 4; row++) {
-    uint8_t idx = compatTop + row;
-    if (idx >= COMPAT_ITEM_COUNT) break;
-    uint8_t y = 22 + row * 10;
-    if (idx == compatSelected) {
-      compatDisplay.drawBox(0, y - 8, 128, 10);
-      compatDisplay.setDrawColor(0);
-    }
-    compatDisplay.drawStr(2, y, COMPAT_ITEMS[idx]);
-    compatDisplay.setDrawColor(1);
-  }
 
   char line[32];
-  snprintf(line, sizeof(line), "S:%u E:%d", sensors.activeCount(), sensors.error());
-  compatDisplay.drawStr(0, 63, line);
+  switch (compatScreen) {
+    case CompatScreen::Main:
+      compatDrawMenu("Line Follower OS", COMPAT_ITEMS, COMPAT_ITEM_COUNT, compatSelected, compatTop);
+      snprintf(line, sizeof(line), "S:%u E:%d", sensors.activeCount(), sensors.error());
+      compatDisplay.drawStr(0, 63, line);
+      break;
+    case CompatScreen::Motor:
+      compatDrawMenu("Motor Settings", COMPAT_MOTOR_ITEMS, 6, compatSubSelected, compatSubTop);
+      if (compatSubSelected == 0) snprintf(line, sizeof(line), "%s", systemState.manualMotorTest ? "Manual ON" : "Manual OFF");
+      if (compatSubSelected == 1) snprintf(line, sizeof(line), "Left %d", settings.motors.leftSpeed);
+      if (compatSubSelected == 2) snprintf(line, sizeof(line), "Right %d", settings.motors.rightSpeed);
+      if (compatSubSelected == 3) snprintf(line, sizeof(line), "Base %d", settings.motors.baseSpeed);
+      if (compatSubSelected == 4) snprintf(line, sizeof(line), "Turn %d", settings.motors.turnSpeed);
+      if (compatSubSelected == 5) snprintf(line, sizeof(line), "Press to save");
+      compatDisplay.drawStr(0, 63, line);
+      break;
+    case CompatScreen::Pid:
+      compatDrawMenu("PID Settings", COMPAT_PID_ITEMS, 5, compatSubSelected, compatSubTop);
+      if (compatSubSelected == 0) snprintf(line, sizeof(line), "Kp %.2f", settings.kp);
+      if (compatSubSelected == 1) snprintf(line, sizeof(line), "Ki %.2f", settings.ki);
+      if (compatSubSelected == 2) snprintf(line, sizeof(line), "Kd %.2f", settings.kd);
+      if (compatSubSelected >= 3) snprintf(line, sizeof(line), "Press OK");
+      compatDisplay.drawStr(0, 63, line);
+      break;
+    case CompatScreen::Sensor:
+      compatDrawMenu("Sensor Settings", COMPAT_SENSOR_ITEMS, 5, compatSubSelected, compatSubTop);
+      if (compatSubSelected == 0) snprintf(line, sizeof(line), "A:%u E:%d", sensors.activeCount(), sensors.error());
+      if (compatSubSelected == 3) snprintf(line, sizeof(line), "Thr %u", settings.sensors.threshold);
+      if (compatSubSelected != 0 && compatSubSelected != 3) snprintf(line, sizeof(line), "Press OK");
+      compatDisplay.drawStr(0, 63, line);
+      break;
+    case CompatScreen::Algorithm:
+      compatDrawMenu("Algorithm", COMPAT_ALG_ITEMS, 7, compatSubSelected, compatSubTop);
+      snprintf(line, sizeof(line), "Now: %s", algorithms.modeName());
+      compatDisplay.drawStr(0, 63, line);
+      break;
+    case CompatScreen::Junction:
+      compatDrawStatus();
+      compatDisplay.drawStr(0, 24, "Junction Memory");
+      snprintf(line, sizeof(line), "Count: %u", algorithms.junctionCount());
+      compatDisplay.drawStr(0, 40, line);
+      compatDisplay.drawStr(0, 58, "Long press back");
+      break;
+    case CompatScreen::Route:
+      compatDrawStatus();
+      compatDisplay.drawStr(0, 22, "Route Memory");
+      compatDisplay.drawStr(0, 36, algorithms.route().substring(0, 20).c_str());
+      snprintf(line, sizeof(line), "Replay:%s Idx:%u", algorithms.replayActive() ? "Y" : "N", algorithms.replayIndex());
+      compatDisplay.drawStr(0, 50, line);
+      compatDisplay.drawStr(0, 63, "R play L stop P clr");
+      break;
+    case CompatScreen::Debug:
+      compatDrawStatus();
+      compatDisplay.drawStr(0, 20, "Debug");
+      snprintf(line, sizeof(line), "Joy %d/%d %s", joystick.rawX(), joystick.rawY(), joyName(joystick.lastAxisEvent()));
+      compatDisplay.drawStr(0, 34, line);
+      snprintf(line, sizeof(line), "Mot %d/%d", motors.leftOutput(), motors.rightOutput());
+      compatDisplay.drawStr(0, 48, line);
+      snprintf(line, sizeof(line), "PID %.1f Err %d", pid.output(), sensors.error());
+      compatDisplay.drawStr(0, 62, line);
+      break;
+    case CompatScreen::Battery:
+      compatDrawStatus();
+      compatDisplay.drawStr(0, 24, "Battery Status");
+      snprintf(line, sizeof(line), "%.2fV %u%%", battery.voltage(), battery.percent());
+      compatDisplay.drawStr(0, 40, line);
+      compatDisplay.drawStr(0, 56, battery.status());
+      break;
+    case CompatScreen::Wifi:
+      compatDrawMenu("Wi-Fi Settings", COMPAT_WIFI_ITEMS, 4, compatSubSelected, compatSubTop);
+      if (compatSubSelected == 0) snprintf(line, sizeof(line), "%s", settings.wifiEnabled ? "WiFi ON" : "WiFi OFF");
+      if (compatSubSelected == 1) snprintf(line, sizeof(line), "AP pass line12345");
+      if (compatSubSelected == 2) snprintf(line, sizeof(line), "%s %ddBm", wifiManager.ip().c_str(), wifiManager.rssi());
+      if (compatSubSelected == 3) snprintf(line, sizeof(line), "Press to save");
+      compatDisplay.drawStr(0, 63, line);
+      break;
+    case CompatScreen::Pin:
+      compatDrawMenu("Device PIN", COMPAT_PIN_ITEMS, 4, compatSubSelected, compatSubTop);
+      snprintf(line, sizeof(line), "PIN %s %s", settings.pinEnabled ? "ON" : "OFF", settings.pin);
+      compatDisplay.drawStr(0, 63, line);
+      break;
+    case CompatScreen::ScreenLock:
+      compatDrawMenu("Screen & Lock", COMPAT_SCREEN_ITEMS, 3, compatSubSelected, compatSubTop);
+      if (compatSubSelected == 0) snprintf(line, sizeof(line), "Sleep %s", compatSleepLabel());
+      if (compatSubSelected == 1) snprintf(line, sizeof(line), "Lock %s", compatLockLabel());
+      if (compatSubSelected == 2) snprintf(line, sizeof(line), "Press save");
+      compatDisplay.drawStr(0, 63, line);
+      break;
+    case CompatScreen::Reset:
+      compatDrawMenu("Reset Options", COMPAT_RESET_ITEMS, 3, compatSubSelected, compatSubTop);
+      compatDisplay.drawStr(0, 63, "Press OK confirm");
+      break;
+    case CompatScreen::About:
+      compatDrawStatus();
+      compatDisplay.drawStr(0, 22, "Line Follower OS");
+      compatDisplay.drawStr(0, 36, "ESP32-S3 SH1106");
+      compatDisplay.drawStr(0, 50, "WiFi:LineFollowerOS");
+      compatDisplay.drawStr(0, 63, "Pass:line12345");
+      break;
+  }
   compatDisplay.sendBuffer();
 }
 
 static void updateCompatUi(JoyEvent event) {
   if (!U8G2_COMPAT_UI || !compatDisplayOk) return;
-  if (event == JoyEvent::Up && compatSelected > 0) compatSelected--;
-  if (event == JoyEvent::Down && compatSelected + 1 < COMPAT_ITEM_COUNT) compatSelected++;
-  if (compatSelected < compatTop) compatTop = compatSelected;
-  if (compatSelected > compatTop + 3) compatTop = compatSelected - 3;
+  if (event == JoyEvent::None) return;
+  if (event == JoyEvent::LongPress) {
+    compatBackToMain(true);
+    renderCompatUi(true);
+    return;
+  }
 
-  if (event == JoyEvent::Press) {
-    switch (compatSelected) {
-      case 0:
-        if (systemState.safeMode || systemState.emergency || !sensors.valid() || !sensors.lineDetected()) {
+  auto moveSub = [](uint8_t count) {
+    if (compatSubSelected < compatSubTop) compatSubTop = compatSubSelected;
+    if (compatSubSelected > compatSubTop + 3) compatSubTop = compatSubSelected - 3;
+    (void)count;
+  };
+
+  if (compatScreen == CompatScreen::Main) {
+    if (event == JoyEvent::Up && compatSelected > 0) compatSelected--;
+    if (event == JoyEvent::Down && compatSelected + 1 < COMPAT_ITEM_COUNT) compatSelected++;
+    if (compatSelected < compatTop) compatTop = compatSelected;
+    if (compatSelected > compatTop + 3) compatTop = compatSelected - 3;
+    if (event == JoyEvent::Press) {
+      switch (compatSelected) {
+        case 0:
+          if (systemState.safeMode || systemState.emergency || !sensors.valid() || !sensors.lineDetected()) {
+            systemState.running = false;
+            compatShowMessage("Cannot start", "Check sensors");
+          } else {
+            systemState.running = !systemState.running;
+            compatShowMessage(systemState.running ? "Robot started" : "Robot stopped");
+          }
+          delay(450);
+          break;
+        case 1:
+          systemState.emergency = !systemState.emergency;
           systemState.running = false;
-          compatShowMessage("Cannot start", "Check sensors");
-        } else {
-          systemState.running = !systemState.running;
-          compatShowMessage(systemState.running ? "Robot started" : "Robot stopped");
-        }
-        delay(450);
-        break;
-      case 1:
-        systemState.emergency = true;
-        systemState.running = false;
-        motors.emergencyStop();
-        compatShowMessage("EMERGENCY STOP", "Motors OFF");
-        delay(650);
-        break;
-      case 2:
-        compatShowMessage("Motor Settings", "Use web dashboard");
-        delay(650);
-        break;
-      case 3:
-        compatShowMessage("PID Settings", "Use web dashboard");
-        delay(650);
-        break;
-      case 4:
-        compatShowMessage("Sensor Values", "See bottom line");
-        delay(650);
-        break;
-      case 5:
-        compatShowMessage("Algorithm", algorithms.modeName());
-        delay(650);
-        break;
-      case 6:
-        compatShowMessage("Debug", joyName(joystick.lastAxisEvent()));
-        delay(650);
-        break;
-      case 8:
-        compatShowMessage("WiFi LineFollowerOS", "Pass line12345");
-        delay(850);
-        break;
-      case 9:
-        compatShowMessage("ESP32-S3", "Line Follower OS");
-        delay(850);
-        break;
-      default:
-        break;
+          if (systemState.emergency) motors.emergencyStop(); else motors.clearEmergency();
+          compatShowMessage(systemState.emergency ? "EMERGENCY STOP" : "Emergency clear", "Motors OFF");
+          delay(650);
+          break;
+        case 2: compatEnter(CompatScreen::Motor); break;
+        case 3: compatEnter(CompatScreen::Pid); break;
+        case 4: compatEnter(CompatScreen::Sensor); break;
+        case 5: compatEnter(CompatScreen::Algorithm); compatSubSelected = static_cast<uint8_t>(settings.algorithm); break;
+        case 6: compatEnter(CompatScreen::Junction); break;
+        case 7: compatEnter(CompatScreen::Route); break;
+        case 8: compatEnter(CompatScreen::Debug); break;
+        case 9: compatEnter(CompatScreen::Battery); break;
+        case 10: compatEnter(CompatScreen::Wifi); break;
+        case 11: compatEnter(CompatScreen::Pin); break;
+        case 12: compatEnter(CompatScreen::ScreenLock); break;
+        case 13: compatEnter(CompatScreen::Reset); break;
+        case 14: compatEnter(CompatScreen::About); break;
+      }
     }
+    renderCompatUi(true);
+    return;
+  }
+
+  uint8_t count = 1;
+  if (compatScreen == CompatScreen::Motor) count = 6;
+  if (compatScreen == CompatScreen::Pid) count = 5;
+  if (compatScreen == CompatScreen::Sensor) count = 5;
+  if (compatScreen == CompatScreen::Algorithm) count = 7;
+  if (compatScreen == CompatScreen::Wifi) count = 4;
+  if (compatScreen == CompatScreen::Pin) count = 4;
+  if (compatScreen == CompatScreen::ScreenLock) count = 3;
+  if (compatScreen == CompatScreen::Reset) count = 3;
+
+  if (event == JoyEvent::Up && compatSubSelected > 0) compatSubSelected--;
+  if (event == JoyEvent::Down && compatSubSelected + 1 < count) compatSubSelected++;
+  moveSub(count);
+
+  int delta = event == JoyEvent::Right ? 1 : event == JoyEvent::Left ? -1 : 0;
+  if (compatScreen == CompatScreen::Motor) {
+    int step = 5 * delta;
+    if (compatSubSelected == 1) settings.motors.leftSpeed = constrain(settings.motors.leftSpeed + step, 0, MANUAL_TEST_MAX_PWM);
+    if (compatSubSelected == 2) settings.motors.rightSpeed = constrain(settings.motors.rightSpeed + step, 0, MANUAL_TEST_MAX_PWM);
+    if (compatSubSelected == 3) settings.motors.baseSpeed = constrain(settings.motors.baseSpeed + step, 0, AUTONOMOUS_MAX_PWM);
+    if (compatSubSelected == 4) settings.motors.turnSpeed = constrain(settings.motors.turnSpeed + step, 0, AUTONOMOUS_MAX_PWM);
+    if (event == JoyEvent::Press && compatSubSelected == 0) systemState.manualMotorTest = !systemState.manualMotorTest;
+    if (event == JoyEvent::Press && compatSubSelected == 5) compatSave();
+  }
+  if (compatScreen == CompatScreen::Pid) {
+    float step = delta * 0.05f;
+    if (compatSubSelected == 0) settings.kp = max(0.0f, settings.kp + step);
+    if (compatSubSelected == 1) settings.ki = max(0.0f, settings.ki + step);
+    if (compatSubSelected == 2) settings.kd = max(0.0f, settings.kd + step);
+    if (event == JoyEvent::Press && compatSubSelected == 3) { settingsStore.savePid(settings.kp, settings.ki, settings.kd); compatShowMessage("PID saved", "Stored in NVS"); delay(550); }
+    if (event == JoyEvent::Press && compatSubSelected == 4) { settings.kp = DEFAULT_KP; settings.ki = DEFAULT_KI; settings.kd = DEFAULT_KD; compatSave("PID reset"); }
+  }
+  if (compatScreen == CompatScreen::Sensor) {
+    if (compatSubSelected == 3 && delta != 0) settings.sensors.threshold = constrain((int)settings.sensors.threshold + delta * 25, 0, 1000);
+    if (event == JoyEvent::Press && compatSubSelected == 1) { sensors.calibrateBlack(); settings.sensors = sensors.calibration(); compatSave("Black saved"); }
+    if (event == JoyEvent::Press && compatSubSelected == 2) { sensors.calibrateWhite(); settings.sensors = sensors.calibration(); compatSave("White saved"); }
+    if (event == JoyEvent::Press && compatSubSelected == 4) compatSave("Sensor saved");
+  }
+  if (compatScreen == CompatScreen::Algorithm && event == JoyEvent::Press) {
+    settings.algorithm = static_cast<AlgorithmMode>(compatSubSelected);
+    algorithms.setMode(settings.algorithm);
+    compatSave("Algorithm saved", compatAlgorithmName(compatSubSelected));
+  }
+  if (compatScreen == CompatScreen::Route) {
+    if (event == JoyEvent::Right) algorithms.startReplay();
+    if (event == JoyEvent::Left) algorithms.stopReplay();
+    if (event == JoyEvent::Press) { algorithms.clearRoute(); compatShowMessage("Route cleared"); delay(450); }
+  }
+  if (compatScreen == CompatScreen::Wifi) {
+    if (event == JoyEvent::Press && compatSubSelected == 0) { settings.wifiEnabled = !settings.wifiEnabled; compatSave("WiFi saved", settings.wifiEnabled ? "ON" : "OFF"); }
+    if (event == JoyEvent::Press && compatSubSelected == 1) { compatShowMessage("SSID LineFollowerOS", "Pass line12345"); delay(900); }
+    if (event == JoyEvent::Press && compatSubSelected == 3) compatSave("WiFi saved");
+  }
+  if (compatScreen == CompatScreen::Pin) {
+    if (event == JoyEvent::Press && compatSubSelected == 1) { settings.pinEnabled = !settings.pinEnabled; compatSave("PIN saved", settings.pinEnabled ? "Enabled" : "Disabled"); }
+    if (event == JoyEvent::Press && compatSubSelected == 2) { strcpy(settings.pin, "0000"); compatSave("PIN reset", "0000"); }
+    if (event == JoyEvent::Press && compatSubSelected == 3) compatSave("PIN saved");
+  }
+  if (compatScreen == CompatScreen::ScreenLock) {
+    if (compatSubSelected == 0 && delta != 0) settings.screenSleepIndex = constrain((int)settings.screenSleepIndex + delta, 0, 6);
+    if (compatSubSelected == 1 && delta != 0) settings.autoLockIndex = constrain((int)settings.autoLockIndex + delta, 0, 2);
+    if (event == JoyEvent::Press && compatSubSelected == 2) compatSave("Screen saved");
+  }
+  if (compatScreen == CompatScreen::Reset && event == JoyEvent::Press) {
+    if (compatSubSelected == 0) { systemState.running = false; motors.stop(); compatShowMessage("Robot reset", "Motors OFF"); delay(550); }
+    if (compatSubSelected == 1) { settingsStore.factoryReset(); compatShowMessage("Factory reset", "Power cycle"); delay(850); }
+    if (compatSubSelected == 2) { settingsStore.pairingReset(); strcpy(settings.wifiSsid, ""); strcpy(settings.wifiPass, ""); compatShowMessage("Pairing reset"); delay(650); }
   }
   renderCompatUi(true);
 }
