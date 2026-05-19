@@ -35,6 +35,7 @@ constexpr bool SENSOR_SERIAL_DEBUG = false;
 constexpr bool JOYSTICK_OLED_TEST = false;
 constexpr bool AUTO_DEBUG_MODE = false;
 constexpr bool BOOT_DIAGNOSTICS = false;
+constexpr bool U8G2_COMPAT_UI = true;
 constexpr bool AUTONOMOUS_LINE_FOLLOW_ENABLED = true;
 constexpr int AUTONOMOUS_MAX_PWM = 95;
 constexpr int MANUAL_TEST_MAX_PWM = 85;

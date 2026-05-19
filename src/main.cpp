@@ -38,6 +38,17 @@ static bool autoDebugDisplayOk = false;
 static uint8_t autoDebugI2cCount = 0;
 static uint8_t autoDebugOledAddress = 0;
 static unsigned long autoDebugCenterSavedUntil = 0;
+static U8G2_SH1106_128X64_NONAME_F_HW_I2C compatDisplay(U8G2_R0, U8X8_PIN_NONE, I2C_SCL_PIN, I2C_SDA_PIN);
+static bool compatDisplayOk = false;
+static uint8_t compatSelected = 0;
+static uint8_t compatTop = 0;
+static unsigned long compatLastRender = 0;
+
+static const char *const COMPAT_ITEMS[] = {
+  "Start / Stop", "Emergency Stop", "Motor Settings", "PID Settings",
+  "Sensor Settings", "Algorithm", "Debug", "Battery", "WiFi", "About"
+};
+static constexpr uint8_t COMPAT_ITEM_COUNT = sizeof(COMPAT_ITEMS) / sizeof(COMPAT_ITEMS[0]);
 
 static void bootPause(unsigned long ms) {
   unsigned long start = millis();
@@ -175,6 +186,124 @@ static const char *joyName(JoyEvent event) {
     case JoyEvent::LongPress: return "LONG";
     default: return "CENTER";
   }
+}
+
+static void compatShowMessage(const char *line1, const char *line2 = "") {
+  if (!compatDisplayOk) return;
+  compatDisplay.clearBuffer();
+  compatDisplay.setFont(u8g2_font_6x10_tf);
+  compatDisplay.drawFrame(0, 0, 128, 64);
+  compatDisplay.drawStr(6, 18, line1);
+  compatDisplay.drawStr(6, 36, line2);
+  compatDisplay.sendBuffer();
+}
+
+static void beginCompatUi() {
+  if (!U8G2_COMPAT_UI) return;
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(100000);
+  compatDisplay.setI2CAddress(OLED_I2C_ADDR << 1);
+  compatDisplayOk = compatDisplay.begin();
+  if (!compatDisplayOk) return;
+  compatDisplay.setContrast(255);
+  compatDisplay.clearBuffer();
+  compatDisplay.drawBox(0, 0, 128, 64);
+  compatDisplay.sendBuffer();
+  delay(250);
+  compatShowMessage("Line Follower OS", "U8G2 display OK");
+  delay(700);
+}
+
+static void renderCompatUi(bool force = false) {
+  if (!U8G2_COMPAT_UI || !compatDisplayOk) return;
+  unsigned long now = millis();
+  if (!force && now - compatLastRender < UI_PERIOD_MS) return;
+  compatLastRender = now;
+
+  compatDisplay.clearBuffer();
+  compatDisplay.setFont(u8g2_font_6x10_tf);
+  compatDisplay.drawStr(0, 8, systemState.running ? "RUN" : "STOP");
+  compatDisplay.drawStr(36, 8, systemState.safeMode ? "SAFE" : "OS");
+  compatDisplay.drawStr(88, 8, "USB");
+  compatDisplay.drawLine(0, 10, 127, 10);
+
+  for (uint8_t row = 0; row < 4; row++) {
+    uint8_t idx = compatTop + row;
+    if (idx >= COMPAT_ITEM_COUNT) break;
+    uint8_t y = 22 + row * 10;
+    if (idx == compatSelected) {
+      compatDisplay.drawBox(0, y - 8, 128, 10);
+      compatDisplay.setDrawColor(0);
+    }
+    compatDisplay.drawStr(2, y, COMPAT_ITEMS[idx]);
+    compatDisplay.setDrawColor(1);
+  }
+
+  char line[32];
+  snprintf(line, sizeof(line), "S:%u E:%d", sensors.activeCount(), sensors.error());
+  compatDisplay.drawStr(0, 63, line);
+  compatDisplay.sendBuffer();
+}
+
+static void updateCompatUi(JoyEvent event) {
+  if (!U8G2_COMPAT_UI || !compatDisplayOk) return;
+  if (event == JoyEvent::Up && compatSelected > 0) compatSelected--;
+  if (event == JoyEvent::Down && compatSelected + 1 < COMPAT_ITEM_COUNT) compatSelected++;
+  if (compatSelected < compatTop) compatTop = compatSelected;
+  if (compatSelected > compatTop + 3) compatTop = compatSelected - 3;
+
+  if (event == JoyEvent::Press) {
+    switch (compatSelected) {
+      case 0:
+        if (systemState.safeMode || systemState.emergency || !sensors.valid() || !sensors.lineDetected()) {
+          systemState.running = false;
+          compatShowMessage("Cannot start", "Check sensors");
+        } else {
+          systemState.running = !systemState.running;
+          compatShowMessage(systemState.running ? "Robot started" : "Robot stopped");
+        }
+        delay(450);
+        break;
+      case 1:
+        systemState.emergency = true;
+        systemState.running = false;
+        motors.emergencyStop();
+        compatShowMessage("EMERGENCY STOP", "Motors OFF");
+        delay(650);
+        break;
+      case 2:
+        compatShowMessage("Motor Settings", "Use web dashboard");
+        delay(650);
+        break;
+      case 3:
+        compatShowMessage("PID Settings", "Use web dashboard");
+        delay(650);
+        break;
+      case 4:
+        compatShowMessage("Sensor Values", "See bottom line");
+        delay(650);
+        break;
+      case 5:
+        compatShowMessage("Algorithm", algorithms.modeName());
+        delay(650);
+        break;
+      case 6:
+        compatShowMessage("Debug", joyName(joystick.lastAxisEvent()));
+        delay(650);
+        break;
+      case 8:
+        compatShowMessage("WiFi LineFollowerOS", "Pass line12345");
+        delay(850);
+        break;
+      case 9:
+        compatShowMessage("ESP32-S3", "Line Follower OS");
+        delay(850);
+        break;
+      default:
+        break;
+    }
+  }
+  renderCompatUi(true);
 }
 
 static void beginJoystickOledTest() {
@@ -874,11 +1003,18 @@ void setup() {
   battery.begin();
   wifiManager.begin(settings.wifiEnabled, settings.wifiSsid, settings.wifiPass);
   systemState.askPinSetup = !settings.pinEnabled;
-  oledUi.begin(&settings, &systemState);
-  runBootDiagnostics();
-  oledUi.showMessage("WiFi LineFollowerOS", "Password line12345");
-  bootPause(1600);
-  oledUi.showHome();
+  if (U8G2_COMPAT_UI) {
+    beginCompatUi();
+    compatShowMessage("WiFi LineFollowerOS", "Pass line12345");
+    delay(900);
+    renderCompatUi(true);
+  } else {
+    oledUi.begin(&settings, &systemState);
+    runBootDiagnostics();
+    oledUi.showMessage("WiFi LineFollowerOS", "Password line12345");
+    bootPause(1600);
+    oledUi.showHome();
+  }
   webDashboard.begin(&settings, &systemState, &pid);
   pid.setTunings(settings.kp, settings.ki, settings.kd);
 
@@ -930,7 +1066,11 @@ void loop() {
     motors.emergencyStop();
   }
 
-  oledUi.update(event);
+  if (U8G2_COMPAT_UI) {
+    updateCompatUi(event);
+  } else {
+    oledUi.update(event);
+  }
 
   if (!systemState.manualMotorTest) {
     runLineFollower();
@@ -939,5 +1079,9 @@ void loop() {
     runManualMotorTest();
   }
 
-  oledUi.render();
+  if (U8G2_COMPAT_UI) {
+    renderCompatUi();
+  } else {
+    oledUi.render();
+  }
 }
